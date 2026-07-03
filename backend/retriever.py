@@ -1,6 +1,6 @@
 from langchain_community.vectorstores import FAISS
 
-from config import embeddings
+from backend.config import embeddings
 
 
 # -------------------------
