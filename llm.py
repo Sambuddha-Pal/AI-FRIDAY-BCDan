@@ -12,3 +12,4 @@ llm = ChatOpenAI(
     http_client=client
 )
 print(llm.invoke("Hello, how are you?"))
+
