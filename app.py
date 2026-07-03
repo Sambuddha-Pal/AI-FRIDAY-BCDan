@@ -1,4 +1,13 @@
 import os
+
+# Some corporate networks intercept TLS with a self-signed cert (the same
+# reason the GenAI Lab httpx.Client below uses verify=False). That breaks the
+# one-time download of the sentence-transformers embedding model from
+# huggingface.co, so relax cert verification for that download too. This must
+# be set before sentence_transformers/huggingface_hub is imported.
+os.environ.setdefault("CURL_CA_BUNDLE", "")
+os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+
 import json
 import time
 import httpx
@@ -230,21 +239,29 @@ def retrieve_context(query: str, k: int = 3, min_score: float = 0.25) -> list[di
     """RAG STEP 3: Retriever function.
     Query embedding -> similarity search against the FAISS index -> returns
     the top-k most relevant knowledge base entries (filtered by a minimum
-    cosine-similarity score so irrelevant complaints don't drag in noise)."""
-    embedder = get_embedder()
-    index = build_knowledge_base_index()
+    cosine-similarity score so irrelevant complaints don't drag in noise).
 
-    query_vector = embedder.encode([query], normalize_embeddings=True).astype("float32")
-    scores, indices = index.search(query_vector, k)
+    Retrieval failures (e.g. embedding model couldn't be downloaded/loaded)
+    are caught here and surfaced as a warning rather than raised, so the LLM
+    call can still proceed without RAG context instead of hard-failing."""
+    try:
+        embedder = get_embedder()
+        index = build_knowledge_base_index()
 
-    results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1 or score < min_score:
-            continue
-        entry = dict(KNOWLEDGE_BASE[idx])
-        entry["score"] = float(score)
-        results.append(entry)
-    return results
+        query_vector = embedder.encode([query], normalize_embeddings=True).astype("float32")
+        scores, indices = index.search(query_vector, k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1 or score < min_score:
+                continue
+            entry = dict(KNOWLEDGE_BASE[idx])
+            entry["score"] = float(score)
+            results.append(entry)
+        return results
+    except Exception as e:
+        st.warning(f"⚠️ Knowledge base retrieval unavailable, continuing without it. Error: {e}")
+        return []
 
 
 # ----------------------------------------
