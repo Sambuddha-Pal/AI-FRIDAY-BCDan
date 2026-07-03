@@ -1,25 +1,22 @@
 import os
-
-# Some corporate networks intercept TLS with a self-signed cert (the same
-# reason the GenAI Lab httpx.Client below uses verify=False). That breaks the
-# one-time download of the sentence-transformers embedding model from
-# huggingface.co, so relax cert verification for that download too. This must
-# be set before sentence_transformers/huggingface_hub is imported.
-os.environ.setdefault("CURL_CA_BUNDLE", "")
-os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
-
 import json
 import time
 import httpx
 import numpy as np
-import faiss
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sentence_transformers import SentenceTransformer
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+import io
 
 try:
     from dotenv import load_dotenv
@@ -45,7 +42,7 @@ if "api_endpoint" not in st.session_state:
     st.session_state.api_endpoint = os.getenv("GENAI_API_ENDPOINT", "https://genailab.tcs.in/")
 
 if "api_key" not in st.session_state:
-    st.session_state.api_key = os.getenv("GENAI_API_KEY", "sk")
+    st.session_state.api_key = os.getenv("GENAI_API_KEY", "sk-bgfhTgskBe3Skyz9ae5mhw")
 
 if "model_name" not in st.session_state:
     st.session_state.model_name = os.getenv("GENAI_MODEL", "genailab-maas-gpt-35-turbo")
@@ -56,11 +53,8 @@ if "temperature" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []  # list of dicts: complaint, result
 
-if "bulk_df" not in st.session_state:
-    st.session_state.bulk_df = None
 
-if "bulk_results" not in st.session_state:
-    st.session_state.bulk_results = None
+
 
 
 # ----------------------------------------
@@ -72,10 +66,7 @@ page = st.sidebar.radio(
     "Navigation",
     [
         "Complaint Analysis",
-        "Bulk Upload",
-        "Analytics",
-        "History",
-        "Settings"
+        "History"
     ]
 )
 
@@ -95,13 +86,7 @@ st.sidebar.info(
     """
 )
 
-# ----------------------------------------
-# RAG — STEP 1 & 2: Sample Knowledge Base + FAISS Vector Store
-# ----------------------------------------
-# This is the internal QA/engineering knowledge base: known defects, root
-# causes, resolutions, and policies. The LLM retrieves the most relevant
-# entries for a given complaint and uses them to ground its analysis
-# (instead of guessing at severity/recommended actions from scratch).
+
 
 KNOWLEDGE_BASE = [
     {
@@ -209,51 +194,46 @@ KNOWLEDGE_BASE = [
 ]
 
 
-@st.cache_resource(show_spinner="Loading embedding model (first run only)...")
-def get_embedder() -> SentenceTransformer:
-    """Loads a small local embedding model. Runs on-device, so it doesn't depend
-    on the custom GenAI Lab gateway supporting an /embeddings endpoint."""
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-
-@st.cache_resource(show_spinner="Building knowledge base vector index...")
-def build_knowledge_base_index() -> faiss.IndexFlatIP:
-    """RAG STEP 1: Knowledge Data -> Embeddings -> FAISS Vector Store (index).
-    Embeds every KB entry once and stores the vectors in a FAISS index.
-    Cached with st.cache_resource so this only runs once per app session,
-    not on every complaint analyzed."""
-    embedder = get_embedder()
-
+@st.cache_resource(show_spinner="Building knowledge base TF-IDF index...")
+def build_knowledge_base_index():
+    """RAG STEP 1: Knowledge Data -> TF-IDF vectors -> local vector store.
+    Fits a TfidfVectorizer on all KB entries once and caches both the
+    vectorizer and the resulting matrix. Purely local — no model download,
+    no network call of any kind. Cached with st.cache_resource so this only
+    runs once per app session, not on every complaint analyzed."""
     texts = [f"{kb['category']} - {kb['title']}: {kb['content']}" for kb in KNOWLEDGE_BASE]
-    vectors = embedder.encode(texts, normalize_embeddings=True)
-    vectors = np.asarray(vectors, dtype="float32")
 
-    dimension = vectors.shape[1]
-    # Normalized vectors + inner product = cosine similarity search
-    index = faiss.IndexFlatIP(dimension)
-    index.add(vectors)
-    return index
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+    matrix = vectorizer.fit_transform(texts)
+    return vectorizer, matrix
 
 
-def retrieve_context(query: str, k: int = 3, min_score: float = 0.25) -> list[dict]:
+def retrieve_context(query: str, k: int = 3, min_score: float = 0.05) -> list[dict]:
     """RAG STEP 3: Retriever function.
-    Query embedding -> similarity search against the FAISS index -> returns
-    the top-k most relevant knowledge base entries (filtered by a minimum
-    cosine-similarity score so irrelevant complaints don't drag in noise).
+    Query -> TF-IDF vector (using the vectorizer fit on the KB) -> cosine
+    similarity search against the KB matrix -> returns the top-k most
+    relevant knowledge base entries (filtered by a minimum similarity score
+    so irrelevant complaints don't drag in noise).
 
-    Retrieval failures (e.g. embedding model couldn't be downloaded/loaded)
-    are caught here and surfaced as a warning rather than raised, so the LLM
-    call can still proceed without RAG context instead of hard-failing."""
+    Note: min_score is lower than a typical embedding-similarity threshold
+    because TF-IDF cosine scores run lower than dense-embedding scores for
+    short queries. Tune this if you find matches too loose/strict.
+
+    Retrieval failures are caught here and surfaced as a warning rather than
+    raised, so the LLM call can still proceed without RAG context instead of
+    hard-failing."""
     try:
-        embedder = get_embedder()
-        index = build_knowledge_base_index()
+        vectorizer, matrix = build_knowledge_base_index()
 
-        query_vector = embedder.encode([query], normalize_embeddings=True).astype("float32")
-        scores, indices = index.search(query_vector, k)
+        query_vector = vectorizer.transform([query])
+        scores = cosine_similarity(query_vector, matrix)[0]
+
+        ranked_indices = np.argsort(scores)[::-1][:k]
 
         results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1 or score < min_score:
+        for idx in ranked_indices:
+            score = scores[idx]
+            if score < min_score:
                 continue
             entry = dict(KNOWLEDGE_BASE[idx])
             entry["score"] = float(score)
@@ -295,8 +275,9 @@ Always respond with STRICT JSON ONLY — no markdown fences, no commentary — m
 
 def get_llm() -> ChatOpenAI:
     """Builds a ChatOpenAI client pointed at the configured GenAI Lab endpoint.
-    Mirrors the pattern from app-2.py: a plain httpx.Client with SSL
-    verification disabled (needed for some internal/self-signed gateways)."""
+    Uses a plain httpx.Client with SSL verification disabled (needed for some
+    internal/self-signed corporate gateways). This is unrelated to the RAG
+    change above — it's specifically for reaching your GenAI Lab endpoint."""
 
     endpoint = st.session_state.api_endpoint.strip()
     api_key = st.session_state.api_key.strip()
@@ -340,10 +321,11 @@ def call_genai_api(complaint_text: str, timeout: int = 30) -> tuple[dict, list[d
     a structured JSON result out of the model's reply. Raises on failure so
     the caller can decide how to surface the error.
 
-    RAG pipeline: embed the complaint -> similarity search the FAISS index ->
-    inject the top matches into the prompt -> LLM generates the final,
-    grounded answer. Returns (parsed_result, retrieved_kb_entries) so the UI
-    can show which knowledge base entries informed the answer."""
+    RAG pipeline: TF-IDF-vectorize the complaint -> cosine similarity search
+    against the local KB matrix -> inject the top matches into the prompt ->
+    LLM generates the final, grounded answer. Returns (parsed_result,
+    retrieved_kb_entries) so the UI can show which knowledge base entries
+    informed the answer."""
 
     llm = get_llm()
 
@@ -410,6 +392,29 @@ def analyze_complaint(text: str) -> dict:
             "source": "fallback"
         }
 
+def generate_pdf(result_dict, complaint_text):
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("AI Complaint Analysis Report", styles["Title"]))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph(f"<b>Complaint:</b><br/>{complaint_text}", styles["BodyText"]))
+    story.append(Spacer(1, 12))
+
+    for key in ["Summary", "Category", "Severity", "Sentiment", "Confidence", "Recommended Action"]:
+        story.append(Paragraph(f"<b>{key}:</b> {result_dict.get(key)}", styles["BodyText"]))
+        story.append(Spacer(1, 6))
+
+    keywords = result_dict.get("Keywords", [])
+    story.append(Paragraph(f"<b>Keywords:</b> {', '.join(keywords)}", styles["BodyText"]))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
 
 # ========================================
 # Complaint Analysis
@@ -450,6 +455,15 @@ if page == "Complaint Analysis":
                 "result": result
             })
 
+            pdf_buffer = generate_pdf(result, complaint)
+
+            st.download_button(
+            label="📄 Download Report as PDF",
+            data=pdf_buffer,
+            file_name=f"complaint_report_{time.strftime('%Y%m%d_%H%M%S')}.pdf",
+            mime="application/pdf"
+)
+
             st.subheader("📋 AI Summary")
             st.write(result["Summary"])
 
@@ -486,220 +500,50 @@ if page == "Complaint Analysis":
             if st.button("Save Edited Summary"):
                 st.session_state.history[-1]["result"]["Summary"] = edited
                 st.success("Saved.")
-        else:
-            st.warning("Please paste a complaint before generating a summary.")
+            else:
+                st.warning("Please paste a complaint before generating a summary.")
 
-# ========================================
-# Bulk Upload
-# ========================================
-
-elif page == "Bulk Upload":
-
-    st.title("📂 Bulk Complaint Upload")
-
-    st.caption("Upload a CSV or JSON file with a column/field named **complaint** (or similar text field).")
-
-    uploaded = st.file_uploader(
-        "Upload CSV or JSON",
-        type=["csv", "json"]
-    )
-
-    if uploaded:
-
-        if uploaded.name.endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_json(uploaded)
-
-        st.session_state.bulk_df = df
-        st.success(f"File uploaded — {len(df)} rows")
-        st.dataframe(df, use_container_width=True)
-
-        # Try to guess which column holds complaint text
-        text_col_candidates = [c for c in df.columns if c.lower() in ("complaint", "text", "complaint_text", "description")]
-        text_col = st.selectbox(
-            "Which column contains the complaint text?",
-            options=list(df.columns),
-            index=(df.columns.get_loc(text_col_candidates[0]) if text_col_candidates else 0)
-        )
-
-        max_rows = st.slider("Max rows to analyze (to control API usage)", 1, min(len(df), 200), min(len(df), 20))
-
-        if st.button("Analyze Complaints"):
-            progress = st.progress(0)
-            results = []
-            subset = df.head(max_rows)
-            for i, row in enumerate(subset.itertuples(index=False)):
-                text = str(getattr(row, text_col) if hasattr(row, text_col) else subset.iloc[i][text_col])
-                res = analyze_complaint(text)
-                results.append({
-                    "Complaint": text,
-                    "Summary": res["Summary"],
-                    "Category": res["Category"],
-                    "Severity": res["Severity"],
-                    "Sentiment": res["Sentiment"],
-                    "Confidence": res["Confidence"],
-                    "Recommended Action": res["Recommended Action"]
-                })
-                progress.progress((i + 1) / len(subset))
-
-            result_df = pd.DataFrame(results)
-            st.session_state.bulk_results = result_df
-            st.success("Processing complete")
-
-        if st.session_state.bulk_results is not None:
-            st.subheader("Results")
-            st.dataframe(st.session_state.bulk_results, use_container_width=True)
-
-            csv_bytes = st.session_state.bulk_results.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download Results as CSV",
-                data=csv_bytes,
-                file_name="complaint_analysis_results.csv",
-                mime="text/csv"
-            )
-
-# ========================================
-# Analytics
-# ========================================
-
-elif page == "Analytics":
-
-    st.title("📊 Complaint Analytics")
-
-    # Prefer real history/bulk data if available, else show sample data
-    records = []
-    for h in st.session_state.history:
-        records.append(h["result"])
-    if st.session_state.bulk_results is not None:
-        records.extend(st.session_state.bulk_results.to_dict("records"))
-
-    if records:
-        df = pd.DataFrame(records)
-        cat_counts = df["Category"].value_counts().reset_index()
-        cat_counts.columns = ["Category", "Count"]
-    else:
-        st.info("No analyzed complaints yet — showing sample data. Analyze some complaints to see live analytics.")
-        cat_counts = pd.DataFrame({
-            "Category": ["Battery", "Display", "Audio", "Battery", "Camera"],
-            "Count": [40, 20, 12, 15, 18]
-        }).groupby("Category", as_index=False).sum()
-
-    fig = px.bar(
-        cat_counts,
-        x="Category",
-        y="Count",
-        color="Category",
-        title="Complaint Categories"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("KPIs")
-    c1, c2, c3 = st.columns(3)
-    total_complaints = len(records) if records else 1520
-    critical = sum(1 for r in records if r.get("Severity") in ("High", "Critical")) if records else 32
-    resolved = total_complaints - critical if records else 1425
-    c1.metric("Complaints", total_complaints)
-    c2.metric("Resolved (est.)", resolved)
-    c3.metric("Critical", critical)
-
-    if records:
-        sev_counts = df["Severity"].value_counts().reset_index()
-        sev_counts.columns = ["Severity", "Count"]
-        fig2 = px.pie(sev_counts, names="Severity", values="Count", title="Severity Breakdown")
-        st.plotly_chart(fig2, use_container_width=True)
 
 # ========================================
 # History
 # ========================================
 
-elif page == "History":
+
+if page == "History":
 
     st.title("📜 Complaint History")
 
-    if st.session_state.history:
-        hist_rows = [{
-            "Timestamp": h["timestamp"],
-            "Complaint": h["complaint"][:80] + ("..." if len(h["complaint"]) > 80 else ""),
-            "Category": h["result"]["Category"],
-            "Severity": h["result"]["Severity"],
-            "Sentiment": h["result"]["Sentiment"],
-        } for h in reversed(st.session_state.history)]
-
-        history_df = pd.DataFrame(hist_rows)
-        st.dataframe(history_df, use_container_width=True)
-
-        csv_bytes = history_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download History as CSV", data=csv_bytes, file_name="complaint_history.csv", mime="text/csv")
-
-        if st.button("🗑️ Clear History"):
-            st.session_state.history = []
-            st.rerun()
+    if not st.session_state.history:
+        st.info("No reports generated yet.")
     else:
-        st.info("No complaints analyzed yet in this session. Go to 'Complaint Analysis' to get started.")
+        for i, item in enumerate(reversed(st.session_state.history)):
+            result = item["result"]
+            with st.expander(f"Report {len(st.session_state.history)-i} • {item['timestamp']}"):
+                st.write("### Original Complaint")
+                st.write(item["complaint"])
 
-# ========================================
-# Settings
-# ========================================
+                st.write("### AI Summary")
+                st.write(result["Summary"])
 
-elif page == "Settings":
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Category", result["Category"])
+                c2.metric("Severity", result["Severity"])
+                c3.metric("Sentiment", result["Sentiment"])
 
-    st.title("⚙️ Settings")
+                st.metric("Confidence", result["Confidence"])
+                st.info(result["Recommended Action"])
 
-    st.markdown("Configure the connection to your GenAI Lab API endpoint below.")
+                if result.get("Keywords"):
+                    st.write("**Keywords:** " + ", ".join(result["Keywords"]))
 
-    st.session_state.api_endpoint = st.text_input(
-        "GenAI API Endpoint (base URL)",
-        value=st.session_state.api_endpoint,
-        help="Base URL of your GenAI Lab gateway, e.g. https://genailab.tcs.in/ "
-             "(do NOT include /chat/completions — langchain adds that automatically)."
-    )
+                pdf = generate_pdf(result, item["complaint"])
 
-    st.session_state.api_key = st.text_input(
-        "API Key",
-        value=st.session_state.api_key,
-        type="password"
-    )
+                st.download_button(
+                    "📄 Download PDF Report",
+                    data=pdf,
+                    file_name=f"Complaint_Report_{len(st.session_state.history)-i}.pdf",
+                    mime="application/pdf",
+                    key=f"history_pdf_{i}"
+                )
+            st.warning("Please paste a complaint before generating a summary.")
 
-    st.session_state.model_name = st.text_input(
-        "Model Name",
-        value=st.session_state.model_name,
-        help="The model identifier expected by your GenAI Lab gateway, e.g. genailab-maas-gpt-35-turbo."
-    )
-
-    st.session_state.temperature = st.slider(
-        "Temperature",
-        0.0,
-        1.0,
-        st.session_state.temperature
-    )
-
-    if st.button("💾 Save Settings"):
-        st.success("Settings saved for this session.")
-
-    st.markdown("---")
-    st.subheader("🔌 Test Connection")
-
-    if st.button("Send Test Complaint"):
-        with st.spinner("Testing connection..."):
-            try:
-                result, retrieved = call_genai_api("The screen flickers randomly and the battery drains within two hours.")
-                st.success("Connection successful! Sample response:")
-                st.json(result)
-                st.caption(f"Retrieved {len(retrieved)} knowledge base match(es) for this test complaint.")
-            except Exception as e:
-                st.error(f"Connection failed: {e}")
-
-    st.markdown("---")
-    st.subheader("📚 Knowledge Base")
-    st.caption(f"{len(KNOWLEDGE_BASE)} entries loaded. Retrieval uses local `all-MiniLM-L6-v2` "
-               "embeddings + a FAISS cosine-similarity index (independent of the GenAI Lab endpoint).")
-    with st.expander("View all knowledge base entries"):
-        st.dataframe(pd.DataFrame(KNOWLEDGE_BASE)[["id", "category", "title"]], use_container_width=True)
-
-    st.markdown("---")
-    st.caption(
-        "Tip: instead of typing the API key here every time, you can set environment variables "
-        "`GENAI_API_ENDPOINT`, `GENAI_API_KEY`, and `GENAI_MODEL` (e.g. in a `.env` file) before "
-        "launching the app, and they'll be used as defaults."
-    )
