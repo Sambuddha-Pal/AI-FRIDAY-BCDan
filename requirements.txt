@@ -1,0 +1,12 @@
+streamlit
+pandas
+plotly
+httpx
+python-dotenv
+langchain-openai
+langchain-core
+
+# RAG additions
+faiss-cpu
+sentence-transformers
+numpy
